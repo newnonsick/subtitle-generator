@@ -9,10 +9,13 @@ from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QScrollArea,
@@ -50,6 +53,9 @@ class SubtitleWorker(QThread):
     progress = pyqtSignal(str, int, str)
     log_message = pyqtSignal(str, str)
     finished = pyqtSignal(bool, str)
+    subtitles_generated = pyqtSignal(
+        dict
+    )  # {file_path: subtitles} for all processed files
 
     def __init__(
         self,
@@ -68,6 +74,7 @@ class SubtitleWorker(QThread):
         self.total_files = 0
         self.current_chunk = 0
         self.total_chunks = 0
+        self.processed_subtitles = {}  # Store all processed files and their subtitles
 
     def calculate_progress(self) -> int:
         if self.total_files == 0:
@@ -164,6 +171,8 @@ class SubtitleWorker(QThread):
                                 f"{stats.speed_ratio():.1f}x speed",
                                 "DEBUG",
                             )
+
+                        self.processed_subtitles[file_path] = subtitles
                     else:
                         self.log_message.emit(
                             f"✗ Failed to export {file_name}", "ERROR"
@@ -180,6 +189,10 @@ class SubtitleWorker(QThread):
             self.progress.emit(
                 "Complete!", 100, f"Successfully processed {self.total_files} file(s)"
             )
+
+            if self.processed_subtitles:
+                self.subtitles_generated.emit(self.processed_subtitles)
+
             self.finished.emit(
                 True,
                 f"Successfully generated subtitles for {self.total_files} file(s)!",
@@ -351,6 +364,9 @@ class SubtitleGeneratorGUI(QMainWindow):
         super().__init__()
         self.file_paths = []
         self.worker = None
+        self.processed_subtitles = (
+            {}
+        )
         self.setup_ui()
         self.setup_logging()
 
@@ -982,10 +998,16 @@ class SubtitleGeneratorGUI(QMainWindow):
         self.cancel_btn.clicked.connect(self.cancel_processing)
         self.cancel_btn.setEnabled(False)
 
+        self.edit_btn = ModernButton("✏ Edit Subtitles", primary=False)
+        self.edit_btn.clicked.connect(self.open_subtitle_editor)
+        self.edit_btn.setEnabled(False)
+        self.edit_btn.setVisible(False)
+
         self.generate_btn = ModernButton("Generate Subtitles", primary=True)
         self.generate_btn.clicked.connect(self.start_processing)
 
         layout.addWidget(self.clear_btn)
+        layout.addWidget(self.edit_btn)
         layout.addWidget(self.cancel_btn)
         layout.addWidget(self.generate_btn)
 
@@ -1158,6 +1180,7 @@ class SubtitleGeneratorGUI(QMainWindow):
         self.worker.progress.connect(self.update_progress)
         self.worker.log_message.connect(self.add_log)
         self.worker.finished.connect(self.processing_finished)
+        self.worker.subtitles_generated.connect(self.on_subtitles_generated)
 
         self.log_console.log("=" * 50, "INFO")
         self.log_console.log("Starting subtitle generation...", "INFO")
@@ -1188,6 +1211,13 @@ class SubtitleGeneratorGUI(QMainWindow):
     def add_log(self, message: str, level: str):
         self.log_console.log(message, level)
 
+    def on_subtitles_generated(self, processed_subtitles: dict):
+        self.processed_subtitles = processed_subtitles
+        file_count = len(processed_subtitles)
+        self.log_console.log(
+            f"Subtitles ready for editing: {file_count} file(s)", "INFO"
+        )
+
     def processing_finished(self, success: bool, message: str):
         self.generate_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
@@ -1195,15 +1225,156 @@ class SubtitleGeneratorGUI(QMainWindow):
         if success:
             self.log_console.log(message, "SUCCESS")
             self.progress_widget.set_status("Ready", 0, "")
+
+            if self.processed_subtitles:
+                self.edit_btn.setEnabled(True)
+                self.edit_btn.setVisible(True)
+                self.log_console.log(
+                    "Click 'Edit Subtitles' to review and modify", "INFO"
+                )
+
             QMessageBox.information(self, "Success", message)
         else:
             self.log_console.log(message, "ERROR")
             self.progress_widget.set_status(
-                "Cancelled" if "cancel" in message.lower() else "Error",
+                "Cancelled" if "cancel" in message.lower() else "Ready",
                 0,
-                "Ready to process",
+                "",
             )
             QMessageBox.warning(self, "Error", message)
+
+    def open_subtitle_editor(self):
+        if not self.processed_subtitles:
+            QMessageBox.warning(
+                self, "No Subtitles", "Please generate subtitles first before editing."
+            )
+            return
+
+        from .subtitle_editor import SubtitleEditorDialog
+
+        try:
+            output_format = self.format_combo.currentText()
+            output_dir = None
+            if self.output_dir_label.text() != "(Same as input)":
+                output_dir = self.output_dir_label.text()
+
+            if len(self.processed_subtitles) > 1:
+                selected_file = self.show_file_selector()
+                if not selected_file:
+                    return
+                files_to_edit = [
+                    (selected_file, self.processed_subtitles[selected_file])
+                ]
+            else:
+                files_to_edit = list(self.processed_subtitles.items())
+
+            for file_path, subtitles in files_to_edit:
+                editor = SubtitleEditorDialog(
+                    file_path, subtitles, output_format, output_dir, self
+                )
+                result = editor.exec_()
+
+                if result == editor.Accepted:
+                    edited_subtitles = editor.get_subtitles()
+                    self.processed_subtitles[file_path] = edited_subtitles
+
+                    # Log success
+                    self.log_console.log(
+                        f"✓ Edited and exported subtitles for: {Path(file_path).name}",
+                        "SUCCESS",
+                    )
+
+        except Exception as e:
+            logger.error(f"Error opening subtitle editor: {e}")
+            QMessageBox.critical(
+                self, "Error", f"Failed to open subtitle editor: {str(e)}"
+            )
+
+    def show_file_selector(self) -> Optional[str]:
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select File to Edit")
+        dialog.setMinimumSize(500, 300)
+
+        layout = QVBoxLayout()
+
+        label = QLabel(
+            f"Select a file to edit subtitles ({len(self.processed_subtitles)} files processed):"
+        )
+        label.setFont(QFont("Segoe UI", 10))
+        layout.addWidget(label)
+
+        file_list = QListWidget()
+        for file_path in self.processed_subtitles.keys():
+            item = QListWidgetItem(Path(file_path).name)
+            item.setData(Qt.ItemDataRole.UserRole, file_path)
+            file_list.addItem(item)
+        file_list.setCurrentRow(0)
+        layout.addWidget(file_list)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        ok_btn = ModernButton("Select", primary=True)
+        ok_btn.clicked.connect(dialog.accept)
+
+        cancel_btn = ModernButton("Cancel", primary=False)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        button_layout.addWidget(ok_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+
+        if dialog.exec_() == QDialog.DialogCode.Accepted:
+            current_item = file_list.currentItem()
+            if current_item:
+                return current_item.data(Qt.ItemDataRole.UserRole)
+        return None
+
+    def export_edited_subtitles(self, file_path: str, subtitles: list):
+        try:
+            from .subtitle_generator import SubtitleGenerator
+
+            config = self.get_config()
+            generator = SubtitleGenerator(config)
+
+            output_format = self.format_combo.currentText()
+
+            if self.output_dir_label.text() != "(Same as input)":
+                output_base = Path(self.output_dir_label.text()) / Path(file_path).stem
+            else:
+                output_base = Path(file_path).parent / Path(file_path).stem
+
+            if output_format == "all":
+                output_path = str(output_base)
+                success = generator.export(subtitles, output_path, None, format="all")
+            else:
+                output_path = str(output_base) + f".{output_format}"
+                success = generator.export(
+                    subtitles, output_path, None, format=output_format
+                )
+
+            if success:
+                self.log_console.log(
+                    f"✓ Re-exported edited subtitles: {output_path}", "SUCCESS"
+                )
+                QMessageBox.information(
+                    self,
+                    "Success",
+                    f"Edited subtitles exported successfully to:\n{output_path}",
+                )
+            else:
+                self.log_console.log("✗ Failed to export edited subtitles", "ERROR")
+                QMessageBox.warning(self, "Error", "Failed to export edited subtitles")
+
+        except Exception as e:
+            logger.error(f"Error exporting edited subtitles: {e}")
+            self.log_console.log(f"✗ Export error: {str(e)}", "ERROR")
+            QMessageBox.critical(
+                self, "Error", f"Failed to export edited subtitles: {str(e)}"
+            )
 
 
 def main():
