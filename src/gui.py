@@ -924,7 +924,6 @@ class SubtitleGeneratorGUI(QMainWindow):
             QLabel {
                 color: #8E8E93;
                 font-size: 12px;
-                font-style: italic;
                 padding: 20px;
                 background: transparent;
             }

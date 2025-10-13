@@ -137,7 +137,6 @@ class FileListItem(QFrame):
                     border-radius: 14px;
                     font-size: 14px;
                     font-weight: bold;
-                    qproperty-alignment: 'AlignCenter';
                     padding: 0;
                 }
                 QPushButton:hover {
