@@ -82,7 +82,6 @@ class JSONExporter(SubtitleExporter):
 
             for sub in subtitles:
                 sub_dict = sub.to_dict()
-                # Remove words if not needed
                 if not self.include_words and "words" in sub_dict:
                     del sub_dict["words"]
                 data["subtitles"].append(sub_dict)

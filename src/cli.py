@@ -48,6 +48,12 @@ Examples:
   # Specify language and model
   gen-subtitle video.mp4 --language en --model base
   
+  # Generate subtitles in multiple languages
+  gen-subtitle video.mp4 --languages en es fr
+  
+  # Multilingual generation with specific output directory
+  gen-subtitle video.mp4 --languages en zh ja --output-dir ./multilingual_subs
+  
   # Enable noise reduction
   gen-subtitle noisy_audio.mp3 --noise-reduction
   
@@ -57,8 +63,8 @@ Examples:
   # Word-level timestamps in JSON format
   gen-subtitle video.mp4 --word-timestamps --format json
   
-  # Batch processing
-  gen-subtitle *.mp4 --output-dir ./subtitles
+  # Batch processing with multiple languages
+  gen-subtitle video1.mp4 video2.mp4 --languages en es --output-dir ./subtitles
   
   # Export all formats
   gen-subtitle video.mp4 --format all
@@ -112,6 +118,13 @@ Examples:
         "--language",
         type=str,
         help="Language code (en, es, fr, etc.) or None for auto-detect",
+    )
+
+    model_group.add_argument(
+        "--languages",
+        type=str,
+        nargs="+",
+        help="Multiple language codes for multilingual generation (e.g., en es fr)",
     )
 
     model_group.add_argument(
@@ -245,6 +258,13 @@ def validate_arguments(args: argparse.Namespace) -> bool:
     if args.word_timestamps and args.format not in ["json", "all"]:
         logger.warning("⚠️  Word timestamps only available in JSON format")
 
+    if args.language and args.languages:
+        logger.error("❌ Cannot specify both --language and --languages")
+        logger.error(
+            "   Use --language for single language or --languages for multiple"
+        )
+        return False
+
     return True
 
 
@@ -253,12 +273,6 @@ def process_single_file(
     media_path: str,
     args: argparse.Namespace,
 ) -> bool:
-    subtitles, stats = generator.generate(media_path, language=args.language)
-
-    if not subtitles:
-        logger.error("❌ No subtitles generated")
-        return False
-
     if args.output:
         output_base = Path(args.output).stem
         output_dir = Path(args.output).parent
@@ -266,14 +280,40 @@ def process_single_file(
         output_base = Path(media_path).stem
         output_dir = Path(media_path).parent
 
-    if args.format == "all":
-        output_path = str(output_dir / output_base)
-        success = generator.export(subtitles, output_path, stats, format="all")
-    else:
-        output_path = str(output_dir / f"{output_base}.{args.format}")
-        success = generator.export(subtitles, output_path, stats, format=args.format)
+    output_base_path = str(output_dir / output_base)
 
-    return success
+    if args.languages:
+        logger.info(
+            f"🌍 Generating subtitles in {len(args.languages)} language(s): {', '.join(args.languages)}"
+        )
+        results = generator.generate_multilingual(media_path, args.languages)
+
+        if not results:
+            logger.error("❌ Multilingual generation failed")
+            return False
+
+        export_results = generator.export_multilingual(
+            results, output_base_path, format=args.format
+        )
+
+        return all(export_results.values())
+    else:
+        subtitles, stats = generator.generate(media_path, language=args.language)
+
+        if not subtitles:
+            logger.error("❌ No subtitles generated")
+            return False
+
+        if args.format == "all":
+            output_path = output_base_path
+            success = generator.export(subtitles, output_path, stats, format="all")
+        else:
+            output_path = f"{output_base_path}.{args.format}"
+            success = generator.export(
+                subtitles, output_path, stats, format=args.format
+            )
+
+        return success
 
 
 def process_batch(
@@ -283,14 +323,49 @@ def process_batch(
 ) -> bool:
     output_dir = args.output or "./subtitles"
 
-    results = generator.batch_process(
-        file_paths,
-        output_dir,
-        output_format=args.format,
-        language=args.language,
-    )
+    if args.languages:
+        logger.info(
+            f"🌍 Batch processing with {len(args.languages)} language(s): {', '.join(args.languages)}"
+        )
 
-    return all(results.values())
+        all_success = True
+        for i, media_path in enumerate(file_paths, 1):
+            logger.info(f"\n{'='*60}")
+            logger.info(f"File {i}/{len(file_paths)}: {Path(media_path).name}")
+            logger.info(f"{'='*60}")
+
+            try:
+                results = generator.generate_multilingual(media_path, args.languages)
+
+                if not results:
+                    logger.error(f"❌ Failed to generate subtitles for {media_path}")
+                    all_success = False
+                    continue
+
+                base_name = Path(media_path).stem
+                output_base_path = str(Path(output_dir) / base_name)
+
+                export_results = generator.export_multilingual(
+                    results, output_base_path, format=args.format
+                )
+
+                if not all(export_results.values()):
+                    all_success = False
+
+            except Exception as e:
+                logger.error(f"❌ Error processing {media_path}: {e}")
+                all_success = False
+
+        return all_success
+    else:
+        results = generator.batch_process(
+            file_paths,
+            output_dir,
+            output_format=args.format,
+            language=args.language,
+        )
+
+        return all(results.values())
 
 
 def main(argv: List[str] | None = None) -> int:

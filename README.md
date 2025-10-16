@@ -9,6 +9,7 @@ A powerful and user-friendly subtitle generation tool powered by OpenAI's Whispe
 
 ### 🎯 Core Capabilities
 - **AI-Powered Transcription**: Leverages OpenAI Whisper with faster-whisper for state-of-the-art speech recognition
+- **Multilingual Generation**: Generate subtitles in multiple languages from a single audio/video file
 - **Multiple Output Formats**: Export subtitles in SRT, VTT, JSON, or all formats at once
 - **Batch Processing**: Process multiple media files simultaneously with progress tracking
 - **Word-Level Timestamps**: Optional word-by-word timing for precise synchronization
@@ -111,7 +112,8 @@ python gen_sub_gui.py
 2. **Configure Settings**: 
    - Select Whisper model size (default: large-v3)
    - Choose output format (SRT, VTT, JSON, or all)
-   - Set language (or leave as "Auto Detect")
+   - **Single Language**: Select from dropdown (or "Auto Detect")
+   - **Multiple Languages**: Check "Enable Multilingual Generation" and click "Select Languages..."
    - Select device (Auto/CPU/CUDA)
 3. **Advanced Settings** (Optional):
    - Enable noise reduction for noisy audio
@@ -124,6 +126,17 @@ python gen_sub_gui.py
    - Play audio segments to verify timing
    - Make adjustments and save changes
 6. **View Logs**: Check the console panel for detailed processing information and statistics
+
+#### Multilingual Generation in GUI
+
+To generate subtitles in multiple languages:
+1. Check the **"Enable Multilingual Generation"** checkbox in the Language section
+2. Click **"Select Languages..."** button
+3. Choose one or more languages from the list (or use "Popular" preset for EN, ES, FR, DE, ZH, JA)
+4. Click "OK" to confirm your selection
+5. Generate subtitles as normal - all selected languages will be processed
+
+The GUI will show progress for each language and create separate files for each (e.g., `video.en.srt`, `video.es.srt`, etc.).
 
 ### CLI Mode (For Automation)
 
@@ -174,6 +187,21 @@ python gen_sub_cli.py "video.mp4" --silence-thresh -35 --min-silence 500
 python gen_sub_cli.py "video.mp4" --workers 4
 ```
 
+**Generate subtitles in multiple languages:**
+```bash
+python gen_sub_cli.py "video.mp4" --languages en es fr
+```
+
+**Multilingual generation with all formats:**
+```bash
+python gen_sub_cli.py "video.mp4" --languages en zh ja --format all
+```
+
+**Batch multilingual processing:**
+```bash
+python gen_sub_cli.py video1.mp4 video2.mp4 --languages en es de --output-dir ./multilingual_subs
+```
+
 ### CLI Arguments
 
 #### Input/Output Options
@@ -183,7 +211,8 @@ python gen_sub_cli.py "video.mp4" --workers 4
 
 #### Model Configuration
 - `-m, --model` - Whisper model size (default: large-v3)
-- `-l, --language` - Language code (e.g., en, es, fr) or auto-detect
+- `-l, --language` - Language code (e.g., en, es, fr) for single language
+- `--languages` - Multiple language codes for multilingual generation (e.g., en es fr)
 - `-d, --device` - Compute device: auto, cpu, cuda (default: auto)
 - `-c, --compute-type` - Compute type: float16, float32, int8 (default: float16)
 
@@ -199,6 +228,87 @@ python gen_sub_cli.py "video.mp4" --workers 4
 - `-w, --workers` - Number of worker threads (default: 4)
 - `-v, --verbose` - Enable verbose logging
 - `-q, --quiet` - Suppress most output
+
+## 🌍 Multilingual Subtitle Generation
+
+One of the most powerful features is the ability to generate subtitles in **multiple languages** from a single audio/video file. The audio is processed only once, and then transcribed into each specified language.
+
+### CLI Usage
+
+Generate subtitles in multiple languages using the `--languages` flag:
+
+```bash
+# Generate English, Spanish, and French subtitles
+python gen_sub_cli.py "video.mp4" --languages en es fr
+
+# Output files will be:
+# video.en.srt
+# video.es.srt
+# video.fr.srt
+```
+
+### Multilingual with Different Formats
+
+```bash
+# Export all languages in all formats (SRT, VTT, JSON)
+python gen_sub_cli.py "video.mp4" --languages en zh ja --format all
+
+# Output files will be:
+# video.en.srt, video.en.vtt, video.en.json
+# video.zh.srt, video.zh.vtt, video.zh.json
+# video.ja.srt, video.ja.vtt, video.ja.json
+```
+
+### Batch Multilingual Processing
+
+```bash
+# Process multiple videos with multiple languages
+python gen_sub_cli.py video1.mp4 video2.mp4 --languages en es de --output-dir ./multilingual_subs
+```
+
+### Python API Usage
+
+```python
+from src.config import Config
+from src.subtitle_generator import SubtitleGenerator
+
+# Initialize generator
+config = Config(model_size="large-v3", device="cuda")
+generator = SubtitleGenerator(config)
+
+# Generate subtitles in multiple languages
+results = generator.generate_multilingual(
+    "video.mp4",
+    languages=["en", "es", "fr", "de"]
+)
+
+# Export all languages
+export_results = generator.export_multilingual(
+    results,
+    "output/video",
+    format="srt"
+)
+
+# Access individual language results
+for lang, (subtitles, stats) in results.items():
+    print(f"{lang}: {len(subtitles)} subtitles in {stats.processing_time:.2f}s")
+```
+
+### Benefits of Multilingual Generation
+
+- **Efficient**: Audio processing (loading, noise reduction, chunking) happens only once
+- **Consistent**: All language versions use the same audio chunks and timing
+- **Time-Saving**: Much faster than running the tool multiple times
+- **Easy Distribution**: Create subtitles for international audiences in one command
+
+### Supported Languages
+
+The tool supports 50+ languages including:
+- **Western European**: en, es, fr, de, it, pt, nl
+- **Asian**: zh, ja, ko, hi, th, vi
+- **Eastern European**: ru, pl, uk, cs, ro
+- **Middle Eastern**: ar, he, fa, tr
+- And many more!
 
 ## 📁 Project Structure
 

@@ -172,7 +172,6 @@ class SubtitleGenerator:
 
         fixed_subtitles = []
 
-        # First pass: adjust end times to prevent overlaps with next subtitle
         for i, subtitle in enumerate(subtitles):
             current_start = subtitle.start
             current_end = subtitle.end
@@ -180,7 +179,6 @@ class SubtitleGenerator:
             if i < len(subtitles) - 1:
                 next_start = subtitles[i + 1].start
 
-                # Check if current subtitle overlaps with next
                 if current_end >= next_start - min_gap:
                     overlaps_found += 1
                     old_end = current_end
@@ -192,7 +190,6 @@ class SubtitleGenerator:
                         f"adjusted end from {old_end:.3f}s to {current_end:.3f}s"
                     )
 
-                    # Ensure minimum duration
                     min_duration = 0.1
                     if current_end - current_start < min_duration:
                         current_end = current_start + min_duration
@@ -211,7 +208,6 @@ class SubtitleGenerator:
             )
             fixed_subtitles.append(fixed_subtitle)
 
-        # Second pass: adjust start times if still too close to previous end
         for i in range(1, len(fixed_subtitles)):
             prev_end = fixed_subtitles[i - 1].end
             current_start = fixed_subtitles[i].start
@@ -226,7 +222,6 @@ class SubtitleGenerator:
                     f"{old_start:.3f}s → {fixed_subtitles[i].start:.3f}s"
                 )
 
-                # Ensure minimum duration after adjustment
                 if fixed_subtitles[i].end <= fixed_subtitles[i].start:
                     fixed_subtitles[i].end = fixed_subtitles[i].start + 0.1
                     logger.debug(
@@ -244,24 +239,19 @@ class SubtitleGenerator:
 
         return fixed_subtitles
 
-    def generate(
-        self,
-        media_path: str,
-        language: Optional[str] = None,
-    ) -> Tuple[List[Subtitle], ProcessingStats]:
-        start_time = time.time()
-
+    def _process_audio_to_chunks(
+        self, media_path: str
+    ) -> Tuple[
+        Optional[np.ndarray], Optional[float], Optional[List[Tuple[int, int]]], float
+    ]:
         is_valid, msg = validate_file(media_path)
         if not is_valid:
             logger.error(f"❌ {msg}")
-            return [], ProcessingStats(0, 0, 0, 0)
-
-        if language is None:
-            language = self.config.language
+            return None, None, None, 0.0
 
         audio_result = self.audio_processor.load_audio(media_path)
         if audio_result is None:
-            return [], ProcessingStats(0, 0, 0, 0)
+            return None, None, None, 0.0
 
         audio, sr = audio_result
         audio_duration = len(audio) / sr
@@ -279,7 +269,7 @@ class SubtitleGenerator:
 
         if not chunks:
             logger.warning("⚠️  No speech detected in audio")
-            return [], ProcessingStats(audio_duration, time.time() - start_time, 0, 0)
+            return audio, sr, [], audio_duration
 
         if self.config.merge_chunks:
             chunks = self.audio_processor.merge_nearby_chunks(
@@ -294,7 +284,26 @@ class SubtitleGenerator:
             target_duration=self.config.target_chunk_duration,
         )
 
-        logger.info(f"🎬 Processing {len(chunks)} chunks...")
+        return audio, sr, chunks, audio_duration
+
+    def generate(
+        self,
+        media_path: str,
+        language: Optional[str] = None,
+    ) -> Tuple[List[Subtitle], ProcessingStats]:
+        start_time = time.time()
+
+        if language is None:
+            language = self.config.language
+
+        audio, sr, chunks, audio_duration = self._process_audio_to_chunks(media_path)
+
+        if audio is None or sr is None or not chunks:
+            return [], ProcessingStats(0, time.time() - start_time, 0, 0)
+
+        logger.info(
+            f"🎬 Processing {len(chunks)} chunks for language: {language or 'auto-detect'}..."
+        )
         all_subtitles = []
 
         chunk_iter = (
@@ -348,6 +357,104 @@ class SubtitleGenerator:
 
         return all_subtitles, stats
 
+    def generate_multilingual(
+        self,
+        media_path: str,
+        languages: List[str],
+    ) -> Dict[str, Tuple[List[Subtitle], ProcessingStats]]:
+        if not languages:
+            logger.error("❌ No languages specified for multilingual generation")
+            return {}
+
+        logger.info(
+            f"🌍 Starting multilingual generation for {len(languages)} language(s): {', '.join(languages)}"
+        )
+
+        start_time = time.time()
+
+        audio, sr, chunks, audio_duration = self._process_audio_to_chunks(media_path)
+
+        if audio is None or sr is None or not chunks:
+            logger.error("❌ Failed to process audio or no speech detected")
+            return {lang: ([], ProcessingStats(0, 0, 0, 0)) for lang in languages}
+
+        results = {}
+
+        for lang_idx, language in enumerate(languages, 1):
+            logger.info(f"\n{'='*60}")
+            logger.info(f"🌐 Language {lang_idx}/{len(languages)}: {language}")
+            logger.info(f"{'='*60}")
+
+            lang_start_time = time.time()
+            logger.info(f"🎬 Processing {len(chunks)} chunks for {language}...")
+
+            all_subtitles = []
+
+            chunk_iter = (
+                tqdm(
+                    chunks,
+                    desc=f"Transcribing ({language})",
+                    disable=logger.level > logging.INFO,
+                )
+                if TQDM_AVAILABLE
+                else chunks
+            )
+
+            for start_sample, end_sample in chunk_iter:
+                chunk_start_sec = start_sample / sr
+                audio_chunk = audio[start_sample:end_sample]
+
+                subtitles = self.transcribe_chunk(
+                    audio_chunk, int(sr), chunk_start_sec, language
+                )
+                all_subtitles.extend(subtitles)
+
+            if all_subtitles and self.config.fix_overlaps:
+                all_subtitles = self._fix_overlapping_subtitles(
+                    all_subtitles, min_gap=self.config.min_subtitle_gap
+                )
+                logger.info(f"🔧 Fixed overlapping subtitle timestamps for {language}")
+
+            for idx, sub in enumerate(all_subtitles, 1):
+                sub.index = idx
+
+            lang_processing_time = time.time() - lang_start_time
+            avg_confidence = None
+
+            if all_subtitles and all_subtitles[0].confidence is not None:
+                confidences = [s.confidence for s in all_subtitles if s.confidence]
+                avg_confidence = (
+                    sum(confidences) / len(confidences) if confidences else None
+                )
+
+            stats = ProcessingStats(
+                total_duration=audio_duration,
+                processing_time=lang_processing_time,
+                chunks_processed=len(chunks),
+                subtitles_generated=len(all_subtitles),
+                avg_confidence=avg_confidence,
+                detected_language=language,
+            )
+
+            logger.info(
+                f"✅ Generated {len(all_subtitles)} subtitles for {language} "
+                f"in {lang_processing_time:.2f}s"
+            )
+            logger.info(f"   Speed: {stats.speed_ratio():.2f}x realtime")
+            if avg_confidence:
+                logger.info(f"   Avg confidence: {avg_confidence:.3f}")
+
+            results[language] = (all_subtitles, stats)
+
+        total_time = time.time() - start_time
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🎉 Multilingual generation complete!")
+        logger.info(f"   Total time: {total_time:.2f}s")
+        logger.info(f"   Languages processed: {len(results)}/{len(languages)}")
+        logger.info(f"{'='*60}\n")
+
+        return results
+
     def export(
         self,
         subtitles: List[Subtitle],
@@ -361,6 +468,37 @@ class SubtitleGenerator:
         else:
             exporter = ExporterFactory.get_exporter(format)
             return exporter.export(subtitles, output_path, stats)
+
+    def export_multilingual(
+        self,
+        results: Dict[str, Tuple[List[Subtitle], ProcessingStats]],
+        output_base_path: str,
+        format: str = "srt",
+    ) -> Dict[str, bool]:
+        export_results = {}
+
+        for language, (subtitles, stats) in results.items():
+            if not subtitles:
+                logger.warning(f"⚠️  No subtitles to export for language: {language}")
+                export_results[language] = False
+                continue
+
+            lang_output_path = f"{output_base_path}.{language}"
+
+            if format == "all":
+                success = self.export(subtitles, lang_output_path, stats, format="all")
+            else:
+                lang_output_path += f".{format}"
+                success = self.export(subtitles, lang_output_path, stats, format=format)
+
+            export_results[language] = success
+
+            if success:
+                logger.info(f"💾 Exported {language} subtitles to: {lang_output_path}")
+            else:
+                logger.error(f"❌ Failed to export {language} subtitles")
+
+        return export_results
 
     def batch_process(
         self,

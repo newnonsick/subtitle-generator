@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QScrollArea,
     QSpinBox,
     QSplitter,
@@ -32,6 +33,7 @@ from .config import (
     AVAILABLE_OUTPUT_FORMATS,
     DEFAULT_MIN_SILENCE,
     DEFAULT_SILENCE_THRESH,
+    LANGUAGE_SUPPORTS,
     MAX_CHUNK_DURATION,
     SUPPORTED_FORMATS,
     TARGET_CHUNK_DURATION,
@@ -55,7 +57,7 @@ class SubtitleWorker(QThread):
     finished = pyqtSignal(bool, str)
     subtitles_generated = pyqtSignal(
         dict
-    )  # {file_path: subtitles} for all processed files
+    )
 
     def __init__(
         self,
@@ -63,30 +65,38 @@ class SubtitleWorker(QThread):
         config: Config,
         output_format: str,
         output_dir: Optional[str] = None,
+        languages: Optional[List[str]] = None,
     ):
         super().__init__()
         self.file_paths = file_paths
         self.config = config
         self.output_format = output_format
         self.output_dir = output_dir
+        self.languages = languages
         self._is_running = True
         self.current_file_idx = 0
         self.total_files = 0
         self.current_chunk = 0
         self.total_chunks = 0
-        self.processed_subtitles = {}  # Store all processed files and their subtitles
+        self.current_language_idx = 0
+        self.total_languages = len(languages) if languages else 1
+        self.processed_subtitles = {}
 
     def calculate_progress(self) -> int:
         if self.total_files == 0:
             return 0
 
-        file_progress = self.current_file_idx / self.total_files
+        total_work_units = self.total_files * self.total_languages
+        completed_files = self.current_file_idx * self.total_languages
+        completed_languages = self.current_language_idx
+
+        base_progress = (completed_files + completed_languages) / total_work_units
 
         if self.total_chunks > 0:
             chunk_progress = self.current_chunk / self.total_chunks
-            file_progress += chunk_progress / self.total_files
+            base_progress += chunk_progress / total_work_units
 
-        return int(file_progress * 100)
+        return int(base_progress * 100)
 
     def run(self):
         try:
@@ -96,6 +106,8 @@ class SubtitleWorker(QThread):
             generator = SubtitleGenerator(self.config)
 
             self.total_files = len(self.file_paths)
+
+            is_multilingual = self.languages and len(self.languages) > 0
 
             for idx, file_path in enumerate(self.file_paths):
                 if not self._is_running:
@@ -115,68 +127,157 @@ class SubtitleWorker(QThread):
                 self.log_message.emit(f"Processing: {file_name}", "INFO")
 
                 try:
-                    self.log_message.emit(f"Analyzing audio...", "DEBUG")
-
-                    subtitles, stats = self._generate_with_progress(
-                        generator, file_path, file_name
-                    )
-
-                    if not subtitles:
+                    if is_multilingual:
+                        if not self.languages:
+                            self.log_message.emit(
+                                "No languages specified for multilingual generation",
+                                "ERROR",
+                            )
+                            if self.total_files == 1:
+                                self.finished.emit(False, "No languages specified")
+                                return
+                            continue
                         self.log_message.emit(
-                            f"✗ No subtitles generated for {file_name}", "WARNING"
-                        )
-                        if self.total_files == 1:
-                            self.finished.emit(False, "No subtitles generated")
-                            return
-                        continue
-
-                    export_progress = int(((idx + 0.95) / self.total_files) * 100)
-                    self.progress.emit(
-                        f"Processing {idx + 1}/{self.total_files}",
-                        export_progress,
-                        f"Exporting: {file_name}",
-                    )
-
-                    if self.output_dir:
-                        output_base = Path(self.output_dir) / Path(file_path).stem
-                    else:
-                        output_base = Path(file_path).parent / Path(file_path).stem
-
-                    if self.output_format == "all":
-                        output_path = str(output_base)
-                        success = generator.export(
-                            subtitles, output_path, stats, format="all"
-                        )
-                    else:
-                        output_path = str(output_base) + f".{self.output_format}"
-                        success = generator.export(
-                            subtitles, output_path, stats, format=self.output_format
+                            f"Generating subtitles in {len(self.languages)} language(s): {', '.join(self.languages)}",
+                            "INFO",
                         )
 
-                    if success:
-                        complete_progress = int(((idx + 1) / self.total_files) * 100)
+                        results = self._generate_multilingual_with_progress(
+                            generator, file_path, file_name
+                        )
+
+                        if not results:
+                            self.log_message.emit(
+                                f"✗ No subtitles generated for {file_name}", "WARNING"
+                            )
+                            if self.total_files == 1:
+                                self.finished.emit(False, "No subtitles generated")
+                                return
+                            continue
+
+                        if self.output_dir:
+                            output_base = Path(self.output_dir) / Path(file_path).stem
+                        else:
+                            output_base = Path(file_path).parent / Path(file_path).stem
+
+                        export_progress = int(((idx + 0.95) / self.total_files) * 100)
                         self.progress.emit(
                             f"Processing {idx + 1}/{self.total_files}",
-                            complete_progress,
-                            f"Completed: {file_name}",
+                            export_progress,
+                            f"Exporting all languages: {file_name}",
                         )
 
-                        self.log_message.emit(f"✓ Completed: {file_name}", "SUCCESS")
-                        self.log_message.emit(f"  Output: {output_path}", "INFO")
+                        all_exported = True
+                        for language, (subtitles, stats) in results.items():
+                            lang_output_base = f"{output_base}.{language}"
 
-                        if stats:
+                            if self.output_format == "all":
+                                success = generator.export(
+                                    subtitles, lang_output_base, stats, format="all"
+                                )
+                            else:
+                                lang_output_path = (
+                                    f"{lang_output_base}.{self.output_format}"
+                                )
+                                success = generator.export(
+                                    subtitles,
+                                    lang_output_path,
+                                    stats,
+                                    format=self.output_format,
+                                )
+
+                            if success:
+                                self.log_message.emit(
+                                    f"  ✓ Exported {language}: {lang_output_base}",
+                                    "SUCCESS",
+                                )
+                            else:
+                                self.log_message.emit(
+                                    f"  ✗ Failed to export {language}", "ERROR"
+                                )
+                                all_exported = False
+
+                        if all_exported:
+                            complete_progress = int(
+                                ((idx + 1) / self.total_files) * 100
+                            )
+                            self.progress.emit(
+                                f"Processing {idx + 1}/{self.total_files}",
+                                complete_progress,
+                                f"Completed: {file_name}",
+                            )
                             self.log_message.emit(
-                                f"  Stats: {stats.subtitles_generated} subtitles, "
-                                f"{stats.processing_time:.1f}s processing time, "
-                                f"{stats.speed_ratio():.1f}x speed",
-                                "DEBUG",
+                                f"✓ Completed all languages: {file_name}", "SUCCESS"
                             )
 
-                        self.processed_subtitles[file_path] = subtitles
+                            self.processed_subtitles[file_path] = results
                     else:
-                        self.log_message.emit(
-                            f"✗ Failed to export {file_name}", "ERROR"
+                        self.log_message.emit(f"Analyzing audio...", "DEBUG")
+
+                        subtitles, stats = self._generate_with_progress(
+                            generator, file_path, file_name
                         )
+
+                        if not subtitles:
+                            self.log_message.emit(
+                                f"✗ No subtitles generated for {file_name}", "WARNING"
+                            )
+                            if self.total_files == 1:
+                                self.finished.emit(False, "No subtitles generated")
+                                return
+                            continue
+
+                        export_progress = int(((idx + 0.95) / self.total_files) * 100)
+                        self.progress.emit(
+                            f"Processing {idx + 1}/{self.total_files}",
+                            export_progress,
+                            f"Exporting: {file_name}",
+                        )
+
+                        if self.output_dir:
+                            output_base = Path(self.output_dir) / Path(file_path).stem
+                        else:
+                            output_base = Path(file_path).parent / Path(file_path).stem
+
+                        if self.output_format == "all":
+                            output_path = str(output_base)
+                            success = generator.export(
+                                subtitles, output_path, stats, format="all"
+                            )
+                        else:
+                            output_path = str(output_base) + f".{self.output_format}"
+                            success = generator.export(
+                                subtitles, output_path, stats, format=self.output_format
+                            )
+
+                        if success:
+                            complete_progress = int(
+                                ((idx + 1) / self.total_files) * 100
+                            )
+                            self.progress.emit(
+                                f"Processing {idx + 1}/{self.total_files}",
+                                complete_progress,
+                                f"Completed: {file_name}",
+                            )
+
+                            self.log_message.emit(
+                                f"✓ Completed: {file_name}", "SUCCESS"
+                            )
+                            self.log_message.emit(f"  Output: {output_path}", "INFO")
+
+                            if stats:
+                                self.log_message.emit(
+                                    f"  Stats: {stats.subtitles_generated} subtitles, "
+                                    f"{stats.processing_time:.1f}s processing time, "
+                                    f"{stats.speed_ratio():.1f}x speed",
+                                    "DEBUG",
+                                )
+
+                            self.processed_subtitles[file_path] = subtitles
+                        else:
+                            self.log_message.emit(
+                                f"✗ Failed to export {file_name}", "ERROR"
+                            )
 
                 except Exception as e:
                     self.log_message.emit(
@@ -193,9 +294,15 @@ class SubtitleWorker(QThread):
             if self.processed_subtitles:
                 self.subtitles_generated.emit(self.processed_subtitles)
 
+            lang_count = len(self.languages) if self.languages else 0
+            lang_msg = (
+                f" in {lang_count} language(s)"
+                if is_multilingual and lang_count > 0
+                else ""
+            )
             self.finished.emit(
                 True,
-                f"Successfully generated subtitles for {self.total_files} file(s)!",
+                f"Successfully generated subtitles{lang_msg} for {self.total_files} file(s)!",
             )
 
         except Exception as e:
@@ -304,6 +411,102 @@ class SubtitleWorker(QThread):
 
         return all_subtitles, stats
 
+    def _generate_multilingual_with_progress(self, generator, file_path, file_name):
+        import time
+
+        from .models import ProcessingStats
+
+        if not self.languages:
+            return {}
+
+        start_time = time.time()
+
+        audio, sr, chunks, audio_duration = generator._process_audio_to_chunks(
+            file_path
+        )
+
+        if audio is None or sr is None or not chunks:
+            self.log_message.emit("Failed to process audio", "ERROR")
+            return {}
+
+        if len(chunks) == 0:
+            self.log_message.emit("No speech detected", "WARNING")
+            return {}
+
+        self.total_chunks = len(chunks)
+        results = {}
+
+        for lang_idx, language in enumerate(self.languages):
+            if not self._is_running:
+                return results
+
+            self.current_language_idx = lang_idx
+            self.current_chunk = 0
+
+            self.log_message.emit(
+                f"  Language {lang_idx + 1}/{len(self.languages)}: {language}", "INFO"
+            )
+            self.log_message.emit(
+                f"  Transcribing {self.total_chunks} chunks for {language}...", "INFO"
+            )
+
+            all_subtitles = []
+            lang_start_time = time.time()
+
+            for chunk_idx, (start_sample, end_sample) in enumerate(chunks):
+                if not self._is_running:
+                    return results
+
+                self.current_chunk = chunk_idx + 1
+                progress = self.calculate_progress()
+
+                self.progress.emit(
+                    f"Processing {self.current_file_idx + 1}/{self.total_files}",
+                    progress,
+                    f"[{language}] Chunk {self.current_chunk}/{self.total_chunks}: {file_name}",
+                )
+
+                chunk_start_sec = start_sample / sr
+                audio_chunk = audio[start_sample:end_sample]
+
+                subtitles = generator.transcribe_chunk(
+                    audio_chunk, int(sr), chunk_start_sec, language
+                )
+                all_subtitles.extend(subtitles)
+
+            if all_subtitles and generator.config.fix_overlaps:
+                all_subtitles = generator._fix_overlapping_subtitles(
+                    all_subtitles, min_gap=generator.config.min_subtitle_gap
+                )
+                self.log_message.emit(
+                    f"  Fixed overlapping timestamps for {language}", "DEBUG"
+                )
+
+            for idx, sub in enumerate(all_subtitles, 1):
+                sub.index = idx
+
+            lang_processing_time = time.time() - lang_start_time
+            stats = ProcessingStats(
+                total_duration=audio_duration,
+                processing_time=lang_processing_time,
+                chunks_processed=len(chunks),
+                subtitles_generated=len(all_subtitles),
+            )
+
+            results[language] = (all_subtitles, stats)
+
+            self.log_message.emit(
+                f"  ✓ {language}: {len(all_subtitles)} subtitles in {lang_processing_time:.1f}s",
+                "SUCCESS",
+            )
+
+        total_time = time.time() - start_time
+        self.log_message.emit(
+            f"Multilingual generation complete in {total_time:.1f}s", "INFO"
+        )
+
+        return results
+
     def stop(self):
         self._is_running = False
 
@@ -364,9 +567,7 @@ class SubtitleGeneratorGUI(QMainWindow):
         super().__init__()
         self.file_paths = []
         self.worker = None
-        self.processed_subtitles = (
-            {}
-        )
+        self.processed_subtitles = {}
         self.setup_ui()
         self.setup_logging()
 
@@ -645,111 +846,9 @@ class SubtitleGeneratorGUI(QMainWindow):
         lang_label = QLabel("Language:")
         lang_label.setFixedWidth(100)
         self.language_combo = QComboBox()
-        self.language_combo.addItems(
-            [
-                "Auto-Detect",
-                "af (Afrikaans)",
-                "sq (Albanian)",
-                "am (Amharic)",
-                "ar (Arabic)",
-                "hy (Armenian)",
-                "as (Assamese)",
-                "az (Azerbaijani)",
-                "ba (Bashkir)",
-                "eu (Basque)",
-                "be (Belarusian)",
-                "bn (Bengali)",
-                "bs (Bosnian)",
-                "br (Breton)",
-                "bg (Bulgarian)",
-                "yue (Cantonese)",
-                "ca (Catalan)",
-                "zh (Chinese)",
-                "hr (Croatian)",
-                "cs (Czech)",
-                "da (Danish)",
-                "nl (Dutch)",
-                "en (English)",
-                "et (Estonian)",
-                "fo (Faroese)",
-                "fi (Finnish)",
-                "fr (French)",
-                "gl (Galician)",
-                "ka (Georgian)",
-                "de (German)",
-                "el (Greek)",
-                "gu (Gujarati)",
-                "ht (Haitian Creole)",
-                "ha (Hausa)",
-                "haw (Hawaiian)",
-                "he (Hebrew)",
-                "hi (Hindi)",
-                "hu (Hungarian)",
-                "is (Icelandic)",
-                "id (Indonesian)",
-                "it (Italian)",
-                "ja (Japanese)",
-                "jw (Javanese)",
-                "kn (Kannada)",
-                "kk (Kazakh)",
-                "km (Khmer)",
-                "ko (Korean)",
-                "lo (Lao)",
-                "la (Latin)",
-                "lv (Latvian)",
-                "ln (Lingala)",
-                "lt (Lithuanian)",
-                "lb (Luxembourgish)",
-                "mk (Macedonian)",
-                "mg (Malagasy)",
-                "ms (Malay)",
-                "ml (Malayalam)",
-                "mt (Maltese)",
-                "mi (Maori)",
-                "mr (Marathi)",
-                "mn (Mongolian)",
-                "my (Myanmar)",
-                "ne (Nepali)",
-                "no (Norwegian)",
-                "nn (Nynorsk)",
-                "oc (Occitan)",
-                "ps (Pashto)",
-                "fa (Persian)",
-                "pl (Polish)",
-                "pt (Portuguese)",
-                "pa (Punjabi)",
-                "ro (Romanian)",
-                "ru (Russian)",
-                "sa (Sanskrit)",
-                "sr (Serbian)",
-                "sn (Shona)",
-                "sd (Sindhi)",
-                "si (Sinhala)",
-                "sk (Slovak)",
-                "sl (Slovenian)",
-                "so (Somali)",
-                "es (Spanish)",
-                "su (Sundanese)",
-                "sw (Swahili)",
-                "sv (Swedish)",
-                "tl (Tagalog)",
-                "tg (Tajik)",
-                "ta (Tamil)",
-                "tt (Tatar)",
-                "te (Telugu)",
-                "th (Thai)",
-                "bo (Tibetan)",
-                "tr (Turkish)",
-                "tk (Turkmen)",
-                "uk (Ukrainian)",
-                "ur (Urdu)",
-                "uz (Uzbek)",
-                "vi (Vietnamese)",
-                "cy (Welsh)",
-                "yi (Yiddish)",
-                "yo (Yoruba)",
-            ]
-        )
+        language_items = [f"{code} ({name})" for code, name in LANGUAGE_SUPPORTS]
+        language_items.insert(0, "Auto Detect")
+        self.language_combo.addItems(language_items)
         self.language_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToContents
         )
@@ -758,7 +857,45 @@ class SubtitleGeneratorGUI(QMainWindow):
         lang_layout.addWidget(self.language_combo, 1)
         model_card.add_layout(lang_layout)
 
+        multilingual_card = SectionCard("🌍 Multilingual Options")
+        multilingual_card.setVisible(False)
+
+        self.multilingual_check = QCheckBox("Enable Multilingual Generation")
+        self.multilingual_check.setToolTip(
+            "Generate subtitles in multiple languages at once"
+        )
+        self.multilingual_check.stateChanged.connect(self.toggle_multilingual_mode)
+        model_card.add_widget(self.multilingual_check)
+
+        multilang_inner_layout = QHBoxLayout()
+
+        self.select_langs_btn = ModernButton("📝 Select Languages", primary=True)
+        self.select_langs_btn.setMaximumWidth(175)
+        self.select_langs_btn.clicked.connect(self.open_language_selector)
+        multilang_inner_layout.addWidget(self.select_langs_btn)
+
+        self.selected_langs_label = QLabel("⚠ No languages selected")
+        self.selected_langs_label.setStyleSheet(
+            """
+            color: #8E8E93; 
+            font-size: 10px;
+            padding: 8px;
+            background-color: #F9F9F9;
+            border: 1px solid #E0E0E0;
+            border-radius: 4px;
+            """
+        )
+        self.selected_langs_label.setWordWrap(True)
+        multilang_inner_layout.addWidget(self.selected_langs_label, 1)
+
+        multilingual_card.add_layout(multilang_inner_layout)
+
+        self.multilingual_card = multilingual_card
+
+        self.selected_languages = []
+
         layout.addWidget(model_card)
+        layout.addWidget(self.multilingual_card)
 
         output_card = SectionCard("💾 Output Configuration")
 
@@ -1133,6 +1270,161 @@ class SubtitleGeneratorGUI(QMainWindow):
             self.output_dir_label.setText(directory)
             self.log_console.log(f"Output directory: {directory}", "INFO")
 
+    def toggle_multilingual_mode(self, state):
+        is_multilingual = state == Qt.CheckState.Checked
+
+        self.multilingual_card.setVisible(is_multilingual)
+        self.language_combo.setEnabled(not is_multilingual)
+
+        if is_multilingual:
+            self.log_console.log("Multilingual mode enabled", "INFO")
+            if not self.selected_languages:
+                self.selected_langs_label.setText(
+                    "⚠ No languages selected - click 'Select Languages' button"
+                )
+                self.selected_langs_label.setStyleSheet(
+                    """
+                    color: #FF9500; 
+                    font-size: 12px;
+                    padding: 8px;
+                    background-color: #FFF3E0;
+                    border: 1px solid #FFB74D;
+                    border-radius: 4px;
+                    """
+                )
+        else:
+            self.log_console.log("Single language mode enabled", "INFO")
+            self.selected_languages = []
+            self.selected_langs_label.setText("⚠ No languages selected")
+            self.selected_langs_label.setStyleSheet(
+                """
+                color: #8E8E93; 
+                font-size: 10px;
+                padding: 8px;
+                background-color: #F9F9F9;
+                border: 1px solid #E0E0E0;
+                border-radius: 4px;
+                """
+            )
+
+    def open_language_selector(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select Languages for Multilingual Generation")
+        dialog.setMinimumSize(500, 400)
+
+        layout = QVBoxLayout()
+
+        info_label = QLabel(
+            "Select one or more languages for subtitle generation.\n"
+            "The audio will be transcribed into each selected language."
+        )
+        info_label.setFont(QFont("Segoe UI", 10))
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+
+        for code, name in LANGUAGE_SUPPORTS:
+            item = QListWidgetItem(f"{code} - {name}")
+            item.setData(Qt.ItemDataRole.UserRole, code)
+            list_widget.addItem(item)
+
+            if code in self.selected_languages:
+                item.setSelected(True)
+
+        layout.addWidget(list_widget)
+
+        quick_select_layout = QHBoxLayout()
+
+        select_all_btn = QPushButton("Select All")
+        select_all_btn.clicked.connect(list_widget.selectAll)
+        quick_select_layout.addWidget(select_all_btn)
+
+        clear_all_btn = QPushButton("Clear All")
+        clear_all_btn.clicked.connect(list_widget.clearSelection)
+        quick_select_layout.addWidget(clear_all_btn)
+
+        popular_btn = QPushButton("Popular (EN, TH)")
+
+        def select_popular():
+            list_widget.clearSelection()
+            popular_codes = ["en", "th"]
+            for i in range(list_widget.count()):
+                item = list_widget.item(i)
+                if item is not None:
+                    code = item.data(Qt.ItemDataRole.UserRole)
+                    if code in popular_codes:
+                        item.setSelected(True)
+
+        popular_btn.clicked.connect(select_popular)
+        quick_select_layout.addWidget(popular_btn)
+
+        quick_select_layout.addStretch()
+        layout.addLayout(quick_select_layout)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        ok_btn = ModernButton("OK", primary=True)
+        ok_btn.clicked.connect(dialog.accept)
+
+        cancel_btn = ModernButton("Cancel", primary=False)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        button_layout.addWidget(ok_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+
+        if dialog.exec_() == QDialog.DialogCode.Accepted:
+            self.selected_languages = []
+            for item in list_widget.selectedItems():
+                code = item.data(Qt.ItemDataRole.UserRole)
+                self.selected_languages.append(code)
+
+            if self.selected_languages:
+                count = len(self.selected_languages)
+                if count <= 5:
+                    langs_text = ", ".join(self.selected_languages)
+                    display_text = f"✓ {count} language(s): {langs_text}"
+                else:
+                    first_three = ", ".join(self.selected_languages[:3])
+                    display_text = f"✓ {count} language(s): {first_three}, ... and {count - 3} more"
+
+                self.selected_langs_label.setText(display_text)
+                self.selected_langs_label.setStyleSheet(
+                    """
+                    color: #34C759; 
+                    font-size: 12px;
+                    font-weight: 500;
+                    padding: 8px;
+                    background-color: #E8F5E9;
+                    border: 1px solid #A5D6A7;
+                    border-radius: 4px;
+                    """
+                )
+                self.log_console.log(
+                    f"Selected {count} language(s): {', '.join(self.selected_languages)}",
+                    "INFO",
+                )
+            else:
+                self.selected_langs_label.setText(
+                    "⚠ No languages selected - click 'Select Languages'"
+                )
+                self.selected_langs_label.setStyleSheet(
+                    """
+                    color: #FF9500; 
+                    font-size: 10px;
+                    padding: 8px;
+                    background-color: #FFF3E0;
+                    border: 1px solid #FFB74D;
+                    border-radius: 4px;
+                    """
+                )
+                self.log_console.log("No languages selected", "WARNING")
+
     def get_config(self) -> Config:
         language = None
         lang_text = self.language_combo.currentText()
@@ -1165,6 +1457,20 @@ class SubtitleGeneratorGUI(QMainWindow):
             )
             return
 
+        is_multilingual = self.multilingual_check.isChecked()
+        languages_to_use = None
+
+        if is_multilingual:
+            if not self.selected_languages:
+                QMessageBox.warning(
+                    self,
+                    "No Languages Selected",
+                    "Please select at least one language for multilingual generation.\n\n"
+                    "Click 'Select Languages...' to choose languages.",
+                )
+                return
+            languages_to_use = self.selected_languages.copy()
+
         output_dir = None
         if self.output_dir_label.text() != "(Same as input)":
             output_dir = self.output_dir_label.text()
@@ -1176,7 +1482,13 @@ class SubtitleGeneratorGUI(QMainWindow):
 
         config = self.get_config()
 
-        self.worker = SubtitleWorker(self.file_paths, config, output_format, output_dir)
+        self.worker = SubtitleWorker(
+            self.file_paths,
+            config,
+            output_format,
+            output_dir,
+            languages=languages_to_use,
+        )
         self.worker.progress.connect(self.update_progress)
         self.worker.log_message.connect(self.add_log)
         self.worker.finished.connect(self.processing_finished)
@@ -1187,6 +1499,8 @@ class SubtitleGeneratorGUI(QMainWindow):
         self.log_console.log(f"Files to process: {len(self.file_paths)}", "INFO")
         self.log_console.log(f"Model: {config.model_size}", "INFO")
         self.log_console.log(f"Device: {config.device}", "INFO")
+        if is_multilingual and languages_to_use:
+            self.log_console.log(f"Languages: {', '.join(languages_to_use)}", "INFO")
         self.log_console.log(f"Output format: {output_format}", "INFO")
 
         self.worker.start()
@@ -1268,21 +1582,47 @@ class SubtitleGeneratorGUI(QMainWindow):
             else:
                 files_to_edit = list(self.processed_subtitles.items())
 
-            for file_path, subtitles in files_to_edit:
-                editor = SubtitleEditorDialog(
-                    file_path, subtitles, output_format, output_dir, self
-                )
-                result = editor.exec_()
-
-                if result == editor.Accepted:
-                    edited_subtitles = editor.get_subtitles()
-                    self.processed_subtitles[file_path] = edited_subtitles
-
-                    # Log success
-                    self.log_console.log(
-                        f"✓ Edited and exported subtitles for: {Path(file_path).name}",
-                        "SUCCESS",
+            for file_path, subtitles_data in files_to_edit:
+                if isinstance(subtitles_data, dict):
+                    language = self.show_language_selector_for_edit(
+                        subtitles_data, file_path
                     )
+                    if not language:
+                        continue
+
+                    subtitles, stats = subtitles_data[language]
+
+                    editor = SubtitleEditorDialog(
+                        file_path, subtitles, output_format, output_dir, self
+                    )
+                    result = editor.exec_()
+
+                    if result == editor.Accepted:
+                        edited_subtitles = editor.get_subtitles()
+                        self.processed_subtitles[file_path][language] = (
+                            edited_subtitles,
+                            stats,
+                        )
+
+                        self.log_console.log(
+                            f"✓ Edited and exported subtitles [{language}] for: {Path(file_path).name}",
+                            "SUCCESS",
+                        )
+                else:
+                    editor = SubtitleEditorDialog(
+                        file_path, subtitles_data, output_format, output_dir, self
+                    )
+                    result = editor.exec_()
+
+                    if result == editor.Accepted:
+                        edited_subtitles = editor.get_subtitles()
+                        self.processed_subtitles[file_path] = edited_subtitles
+
+                        # Log success
+                        self.log_console.log(
+                            f"✓ Edited and exported subtitles for: {Path(file_path).name}",
+                            "SUCCESS",
+                        )
 
         except Exception as e:
             logger.error(f"Error opening subtitle editor: {e}")
@@ -1329,6 +1669,91 @@ class SubtitleGeneratorGUI(QMainWindow):
 
         if dialog.exec_() == QDialog.DialogCode.Accepted:
             current_item = file_list.currentItem()
+            if current_item:
+                return current_item.data(Qt.ItemDataRole.UserRole)
+        return None
+
+    def show_language_selector_for_edit(
+        self, multilingual_data: dict, file_path: str
+    ) -> Optional[str]:
+        """Show a dialog to select which language to edit."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select Language to Edit")
+        dialog.setMinimumSize(500, 350)
+
+        layout = QVBoxLayout()
+
+        file_name = Path(file_path).name
+        file_label = QLabel(f"📄 File: {file_name}")
+        file_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        file_label.setStyleSheet(
+            """
+            color: #1C1C1E;
+            padding: 8px;
+            background-color: #F2F2F7;
+            border-radius: 6px;
+            """
+        )
+        file_label.setWordWrap(True)
+        layout.addWidget(file_label)
+
+        label = QLabel(
+            f"Select a language to edit ({len(multilingual_data)} languages available):"
+        )
+        label.setFont(QFont("Segoe UI", 10))
+        label.setStyleSheet("margin-top: 8px;")
+        layout.addWidget(label)
+
+        language_list = QListWidget()
+        language_list.setStyleSheet(
+            """
+            QListWidget {
+                border: 1px solid #D1D1D6;
+                border-radius: 6px;
+                background-color: white;
+                padding: 4px;
+            }
+            QListWidget::item {
+                padding: 8px;
+                border-radius: 4px;
+                margin: 2px;
+            }
+            QListWidget::item:hover {
+                background-color: #E5F2FF;
+            }
+            QListWidget::item:selected {
+                background-color: #007AFF;
+                color: white;
+            }
+            """
+        )
+
+        for language, (subtitles, stats) in multilingual_data.items():
+            subtitle_count = len(subtitles)
+            item_text = f"🌐 {language.upper()} — {subtitle_count} subtitles, {stats.processing_time:.1f}s"
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.ItemDataRole.UserRole, language)
+            language_list.addItem(item)
+        language_list.setCurrentRow(0)
+        layout.addWidget(language_list)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        ok_btn = ModernButton("Edit", primary=True)
+        ok_btn.clicked.connect(dialog.accept)
+
+        cancel_btn = ModernButton("Cancel", primary=False)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        button_layout.addWidget(ok_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+
+        if dialog.exec_() == QDialog.DialogCode.Accepted:
+            current_item = language_list.currentItem()
             if current_item:
                 return current_item.data(Qt.ItemDataRole.UserRole)
         return None

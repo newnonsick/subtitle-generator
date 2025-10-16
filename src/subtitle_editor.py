@@ -44,7 +44,6 @@ class SubtitleEditorDialog(QDialog):
         self.modified = False
         self.current_row = -1
 
-        # Initialize media player
         self.media_player = QMediaPlayer()
         self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(audio_file)))
         self.media_player.positionChanged.connect(self.on_position_changed)
