@@ -369,6 +369,7 @@ class SubtitleGenerator:
         logger.info(
             f"🌍 Starting multilingual generation for {len(languages)} language(s): {', '.join(languages)}"
         )
+        logger.info(f"   Synchronized mode: All languages will share the same timings")
 
         start_time = time.time()
 
@@ -379,6 +380,7 @@ class SubtitleGenerator:
             return {lang: ([], ProcessingStats(0, 0, 0, 0)) for lang in languages}
 
         results = {}
+        master_timings = None
 
         for lang_idx, language in enumerate(languages, 1):
             logger.info(f"\n{'='*60}")
@@ -386,34 +388,111 @@ class SubtitleGenerator:
             logger.info(f"{'='*60}")
 
             lang_start_time = time.time()
-            logger.info(f"🎬 Processing {len(chunks)} chunks for {language}...")
 
-            all_subtitles = []
-
-            chunk_iter = (
-                tqdm(
-                    chunks,
-                    desc=f"Transcribing ({language})",
-                    disable=logger.level > logging.INFO,
+            if lang_idx == 1:
+                logger.info(
+                    f"🎬 Processing {len(chunks)} chunks for {language} (establishing master timings)..."
                 )
-                if TQDM_AVAILABLE
-                else chunks
-            )
+                all_subtitles = []
 
-            for start_sample, end_sample in chunk_iter:
-                chunk_start_sec = start_sample / sr
-                audio_chunk = audio[start_sample:end_sample]
-
-                subtitles = self.transcribe_chunk(
-                    audio_chunk, int(sr), chunk_start_sec, language
+                chunk_iter = (
+                    tqdm(
+                        chunks,
+                        desc=f"Transcribing ({language})",
+                        disable=logger.level > logging.INFO,
+                    )
+                    if TQDM_AVAILABLE
+                    else chunks
                 )
-                all_subtitles.extend(subtitles)
 
-            if all_subtitles and self.config.fix_overlaps:
-                all_subtitles = self._fix_overlapping_subtitles(
-                    all_subtitles, min_gap=self.config.min_subtitle_gap
+                for start_sample, end_sample in chunk_iter:
+                    chunk_start_sec = start_sample / sr
+                    audio_chunk = audio[start_sample:end_sample]
+
+                    subtitles = self.transcribe_chunk(
+                        audio_chunk, int(sr), chunk_start_sec, language
+                    )
+                    all_subtitles.extend(subtitles)
+
+                if all_subtitles and self.config.fix_overlaps:
+                    all_subtitles = self._fix_overlapping_subtitles(
+                        all_subtitles, min_gap=self.config.min_subtitle_gap
+                    )
+                    logger.info(
+                        f"🔧 Fixed overlapping subtitle timestamps for {language}"
+                    )
+
+                master_timings = [(sub.start, sub.end) for sub in all_subtitles]
+                logger.info(
+                    f"📌 Established {len(master_timings)} synchronized timing segments"
                 )
-                logger.info(f"🔧 Fixed overlapping subtitle timestamps for {language}")
+
+            else:
+                if master_timings is None:
+                    logger.error("❌ Master timings not established")
+                    continue
+
+                logger.info(
+                    f"🎬 Processing with {len(master_timings)} synchronized segments for {language}..."
+                )
+                all_subtitles = []
+
+                segment_iter = (
+                    tqdm(
+                        master_timings,
+                        desc=f"Transcribing ({language})",
+                        disable=logger.level > logging.INFO,
+                    )
+                    if TQDM_AVAILABLE
+                    else master_timings
+                )
+
+                for seg_idx, (seg_start, seg_end) in enumerate(segment_iter):
+                    start_sample = int(seg_start * sr)
+                    end_sample = int(seg_end * sr)
+
+                    audio_segment = audio[start_sample:end_sample]
+
+                    segment_subtitles = self.transcribe_chunk(
+                        audio_segment, int(sr), seg_start, language
+                    )
+
+                    if segment_subtitles:
+                        combined_text = " ".join(sub.text for sub in segment_subtitles)
+                        avg_confidence = None
+                        if segment_subtitles[0].confidence is not None:
+                            confidences = [
+                                s.confidence for s in segment_subtitles if s.confidence
+                            ]
+                            avg_confidence = (
+                                sum(confidences) / len(confidences)
+                                if confidences
+                                else None
+                            )
+
+                        synced_subtitle = Subtitle(
+                            index=seg_idx + 1,
+                            start=seg_start,
+                            end=seg_end,
+                            text=combined_text.strip(),
+                            confidence=avg_confidence,
+                            words=None,
+                        )
+                        all_subtitles.append(synced_subtitle)
+                    else:
+                        synced_subtitle = Subtitle(
+                            index=seg_idx + 1,
+                            start=seg_start,
+                            end=seg_end,
+                            text="[No speech detected]",
+                            confidence=None,
+                            words=None,
+                        )
+                        all_subtitles.append(synced_subtitle)
+
+                logger.info(
+                    f"✅ Synchronized {len(all_subtitles)} subtitle segments for {language}"
+                )
 
             for idx, sub in enumerate(all_subtitles, 1):
                 sub.index = idx
@@ -430,7 +509,11 @@ class SubtitleGenerator:
             stats = ProcessingStats(
                 total_duration=audio_duration,
                 processing_time=lang_processing_time,
-                chunks_processed=len(chunks),
+                chunks_processed=(
+                    len(chunks)
+                    if lang_idx == 1
+                    else (len(master_timings) if master_timings else 0)
+                ),
                 subtitles_generated=len(all_subtitles),
                 avg_confidence=avg_confidence,
                 detected_language=language,
@@ -451,6 +534,10 @@ class SubtitleGenerator:
         logger.info(f"🎉 Multilingual generation complete!")
         logger.info(f"   Total time: {total_time:.2f}s")
         logger.info(f"   Languages processed: {len(results)}/{len(languages)}")
+        if master_timings:
+            logger.info(
+                f"   Synchronization: All languages use {len(master_timings)} matching time segments"
+            )
         logger.info(f"{'='*60}\n")
 
         return results

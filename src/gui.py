@@ -55,9 +55,7 @@ class SubtitleWorker(QThread):
     progress = pyqtSignal(str, int, str)
     log_message = pyqtSignal(str, str)
     finished = pyqtSignal(bool, str)
-    subtitles_generated = pyqtSignal(
-        dict
-    )
+    subtitles_generated = pyqtSignal(dict)
 
     def __init__(
         self,
@@ -414,7 +412,7 @@ class SubtitleWorker(QThread):
     def _generate_multilingual_with_progress(self, generator, file_path, file_name):
         import time
 
-        from .models import ProcessingStats
+        from .models import ProcessingStats, Subtitle
 
         if not self.languages:
             return {}
@@ -435,6 +433,7 @@ class SubtitleWorker(QThread):
 
         self.total_chunks = len(chunks)
         results = {}
+        master_timings = None
 
         for lang_idx, language in enumerate(self.languages):
             if not self._is_running:
@@ -446,40 +445,112 @@ class SubtitleWorker(QThread):
             self.log_message.emit(
                 f"  Language {lang_idx + 1}/{len(self.languages)}: {language}", "INFO"
             )
-            self.log_message.emit(
-                f"  Transcribing {self.total_chunks} chunks for {language}...", "INFO"
-            )
 
-            all_subtitles = []
             lang_start_time = time.time()
 
-            for chunk_idx, (start_sample, end_sample) in enumerate(chunks):
-                if not self._is_running:
-                    return results
+            if lang_idx == 0:
+                self.log_message.emit(
+                    f"  Transcribing {self.total_chunks} chunks (establishing master timings)...",
+                    "INFO",
+                )
+                all_subtitles = []
 
-                self.current_chunk = chunk_idx + 1
-                progress = self.calculate_progress()
+                for chunk_idx, (start_sample, end_sample) in enumerate(chunks):
+                    if not self._is_running:
+                        return results
 
-                self.progress.emit(
-                    f"Processing {self.current_file_idx + 1}/{self.total_files}",
-                    progress,
-                    f"[{language}] Chunk {self.current_chunk}/{self.total_chunks}: {file_name}",
+                    self.current_chunk = chunk_idx + 1
+                    progress = self.calculate_progress()
+
+                    self.progress.emit(
+                        f"Processing {self.current_file_idx + 1}/{self.total_files}",
+                        progress,
+                        f"[{language}] Chunk {self.current_chunk}/{self.total_chunks}: {file_name}",
+                    )
+
+                    chunk_start_sec = start_sample / sr
+                    audio_chunk = audio[start_sample:end_sample]
+
+                    subtitles = generator.transcribe_chunk(
+                        audio_chunk, int(sr), chunk_start_sec, language
+                    )
+                    all_subtitles.extend(subtitles)
+
+                if all_subtitles and generator.config.fix_overlaps:
+                    all_subtitles = generator._fix_overlapping_subtitles(
+                        all_subtitles, min_gap=generator.config.min_subtitle_gap
+                    )
+                    self.log_message.emit(
+                        f"  Fixed overlapping timestamps for {language}", "DEBUG"
+                    )
+
+                master_timings = [(sub.start, sub.end) for sub in all_subtitles]
+                self.log_message.emit(
+                    f"  📌 Established {len(master_timings)} synchronized timing segments",
+                    "INFO",
                 )
 
-                chunk_start_sec = start_sample / sr
-                audio_chunk = audio[start_sample:end_sample]
+            else:
+                if master_timings is None:
+                    self.log_message.emit("Master timings not established", "ERROR")
+                    continue
 
-                subtitles = generator.transcribe_chunk(
-                    audio_chunk, int(sr), chunk_start_sec, language
-                )
-                all_subtitles.extend(subtitles)
-
-            if all_subtitles and generator.config.fix_overlaps:
-                all_subtitles = generator._fix_overlapping_subtitles(
-                    all_subtitles, min_gap=generator.config.min_subtitle_gap
+                self.total_chunks = len(
+                    master_timings
                 )
                 self.log_message.emit(
-                    f"  Fixed overlapping timestamps for {language}", "DEBUG"
+                    f"  Transcribing {len(master_timings)} synchronized segments...",
+                    "INFO",
+                )
+                all_subtitles = []
+
+                for seg_idx, (seg_start, seg_end) in enumerate(master_timings):
+                    if not self._is_running:
+                        return results
+
+                    self.current_chunk = seg_idx + 1
+                    progress = self.calculate_progress()
+
+                    self.progress.emit(
+                        f"Processing {self.current_file_idx + 1}/{self.total_files}",
+                        progress,
+                        f"[{language}] Segment {self.current_chunk}/{len(master_timings)}: {file_name}",
+                    )
+
+                    start_sample = int(seg_start * sr)
+                    end_sample = int(seg_end * sr)
+
+                    audio_segment = audio[start_sample:end_sample]
+
+                    segment_subtitles = generator.transcribe_chunk(
+                        audio_segment, int(sr), seg_start, language
+                    )
+
+                    if segment_subtitles:
+                        combined_text = " ".join(sub.text for sub in segment_subtitles)
+                        avg_confidence = None
+                        if segment_subtitles[0].confidence is not None:
+                            confidences = [
+                                s.confidence for s in segment_subtitles if s.confidence
+                            ]
+                            avg_confidence = (
+                                sum(confidences) / len(confidences)
+                                if confidences
+                                else None
+                            )
+
+                        synced_subtitle = Subtitle(
+                            index=seg_idx + 1,
+                            start=seg_start,
+                            end=seg_end,
+                            text=combined_text.strip(),
+                            confidence=avg_confidence,
+                            words=None,
+                        )
+                        all_subtitles.append(synced_subtitle)
+
+                self.log_message.emit(
+                    f"  ✅ Synchronized {len(all_subtitles)} subtitle segments", "INFO"
                 )
 
             for idx, sub in enumerate(all_subtitles, 1):
@@ -489,7 +560,7 @@ class SubtitleWorker(QThread):
             stats = ProcessingStats(
                 total_duration=audio_duration,
                 processing_time=lang_processing_time,
-                chunks_processed=len(chunks),
+                chunks_processed=len(chunks) if lang_idx == 0 else len(master_timings),
                 subtitles_generated=len(all_subtitles),
             )
 
@@ -504,6 +575,11 @@ class SubtitleWorker(QThread):
         self.log_message.emit(
             f"Multilingual generation complete in {total_time:.1f}s", "INFO"
         )
+        if master_timings:
+            self.log_message.emit(
+                f"🔗 All languages synchronized with {len(master_timings)} matching time segments",
+                "INFO",
+            )
 
         return results
 

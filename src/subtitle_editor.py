@@ -43,6 +43,7 @@ class SubtitleEditorDialog(QDialog):
         self.output_dir = output_dir
         self.modified = False
         self.current_row = -1
+        self.segment_end_ms = None
 
         self.media_player = QMediaPlayer()
         self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(audio_file)))
@@ -372,12 +373,10 @@ class SubtitleEditorDialog(QDialog):
 
         logger.info(f"Playing segment: {subtitle.start:.2f}s - {subtitle.end:.2f}s")
 
+        self.segment_end_ms = end_ms
+
         self.media_player.setPosition(start_ms)
         self.media_player.play()
-
-        QTimer.singleShot(
-            int((subtitle.end - subtitle.start) * 1000), self.stop_playback
-        )
 
         self.play_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -386,6 +385,7 @@ class SubtitleEditorDialog(QDialog):
         if self.media_player.state() != QMediaPlayer.State.StoppedState:
             self.media_player.stop()
 
+        self.segment_end_ms = None
         self.play_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.playback_position_label.setText("")
@@ -394,6 +394,9 @@ class SubtitleEditorDialog(QDialog):
         if self.media_player.state() == QMediaPlayer.State.PlayingState:
             seconds = position / 1000.0
             self.playback_position_label.setText(f"Playing: {seconds:.2f}s")
+
+            if self.segment_end_ms is not None and position >= self.segment_end_ms:
+                self.stop_playback()
 
     def on_state_changed(self, state):
         if state == QMediaPlayer.State.StoppedState:

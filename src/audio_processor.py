@@ -204,36 +204,94 @@ class AudioProcessor:
                 final_chunks.append((start, end))
             else:
                 split_count += 1
-                logger.debug(
-                    f"   Splitting {duration:.1f}s chunk into smaller segments"
-                )
+                logger.debug(f"   Splitting {duration:.1f}s chunk at silent parts")
 
                 chunk_audio = audio[start:end]
 
-                window_size = int(sr * 0.5)
-                hop = int(sr * 0.25)
+                frame_length = int(sr * 0.025)
+                hop_length = int(sr * 0.010)
 
-                energies = []
-                positions = []
+                energy = librosa.feature.rms(
+                    y=chunk_audio, frame_length=frame_length, hop_length=hop_length
+                )[0]
 
-                for i in range(0, len(chunk_audio) - window_size, hop):
-                    window = chunk_audio[i : i + window_size]
-                    energy = np.sqrt(np.mean(window**2))
-                    energies.append(energy)
-                    positions.append(start + i + window_size // 2)
+                energy_db = librosa.amplitude_to_db(energy, ref=np.max(energy))
 
-                if not energies:
+                silence_threshold = -40
+                is_silent = energy_db < silence_threshold
+
+                min_silence_frames = int(0.2 * sr / hop_length)
+
+                silent_regions = []
+                in_silence = False
+                silence_start = 0
+
+                for i, silent in enumerate(is_silent):
+                    if silent:
+                        if not in_silence:
+                            silence_start = i
+                            in_silence = True
+                    else:
+                        if in_silence:
+                            silence_length = i - silence_start
+                            if silence_length >= min_silence_frames:
+                                silence_start_sample = start + (
+                                    silence_start * hop_length
+                                )
+                                silence_end_sample = start + (i * hop_length)
+                                split_point = (
+                                    silence_start_sample + silence_end_sample
+                                ) // 2
+                                silent_regions.append(split_point)
+                            in_silence = False
+
+                if (
+                    in_silence
+                    and (len(is_silent) - silence_start) >= min_silence_frames
+                ):
+                    silence_start_sample = start + (silence_start * hop_length)
+                    silence_end_sample = end
+                    split_point = (silence_start_sample + silence_end_sample) // 2
+                    silent_regions.append(split_point)
+
+                if not silent_regions:
+                    logger.debug(
+                        f"   No clear silence found, using low-energy splitting"
+                    )
                     target_samples = int(target_duration * sr)
                     current = start
-                    while current < end:
-                        next_pos = min(current + target_samples, end)
-                        final_chunks.append((current, next_pos))
-                        current = next_pos
-                    continue
 
-                energies = np.array(energies)
-                if energies.max() > 0:
-                    energies = energies / energies.max()
+                    while current < end:
+                        if end - current <= target_samples:
+                            final_chunks.append((current, end))
+                            break
+
+                        ideal_split = current + target_samples
+                        search_window = int(sr * 2)
+                        search_start = max(
+                            current + int(sr * 5), ideal_split - search_window
+                        )
+                        search_end = min(end, ideal_split + search_window)
+
+                        frame_start = max(0, (search_start - start) // hop_length)
+                        frame_end = min(len(energy), (search_end - start) // hop_length)
+
+                        if frame_end > frame_start:
+                            local_energies = energy[frame_start:frame_end]
+                            if len(local_energies) > 0:
+                                min_idx = np.argmin(local_energies)
+                                split_pos = start + (
+                                    (frame_start + min_idx) * hop_length
+                                )
+                            else:
+                                split_pos = ideal_split
+                        else:
+                            split_pos = ideal_split
+
+                        final_chunks.append((int(current), int(split_pos)))
+                        current = split_pos
+
+                    continue
 
                 num_segments = int(np.ceil(duration / target_duration))
                 target_samples = int(target_duration * sr)
@@ -242,29 +300,30 @@ class AudioProcessor:
                 for seg_idx in range(num_segments - 1):
                     ideal_split = current_start + target_samples
 
-                    search_window = int(sr * 3)
-                    search_start = max(0, ideal_split - search_window)
-                    search_end = min(end, ideal_split + search_window)
+                    min_next_split = current_start + int(5 * sr)
 
-                    valid_positions = [
-                        (pos, energies[i])
-                        for i, pos in enumerate(positions)
-                        if search_start <= pos <= search_end
+                    valid_silences = [
+                        s
+                        for s in silent_regions
+                        if min_next_split <= s < end and s > current_start
                     ]
 
-                    if valid_positions:
-                        split_pos = min(valid_positions, key=lambda x: x[1])[0]
+                    if valid_silences:
+                        split_pos = min(
+                            valid_silences, key=lambda x: abs(x - ideal_split)
+                        )
+                        final_chunks.append((int(current_start), int(split_pos)))
+                        current_start = split_pos
+                        silent_regions = [s for s in silent_regions if s != split_pos]
                     else:
-                        split_pos = ideal_split
+                        continue
 
-                    final_chunks.append((int(current_start), int(split_pos)))
-                    current_start = split_pos
-
-                final_chunks.append((int(current_start), int(end)))
+                if current_start < end:
+                    final_chunks.append((int(current_start), int(end)))
 
         if split_count > 0:
             logger.info(
-                f"✂️  Split {split_count} long chunks → {len(final_chunks)} total chunks"
+                f"✂️  Split {split_count} long chunks at silent parts → {len(final_chunks)} total chunks"
             )
 
         return final_chunks
